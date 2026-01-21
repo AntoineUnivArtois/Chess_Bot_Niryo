@@ -1,0 +1,17 @@
+name: chess-bot
+channels:
+  - defaults
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.8
+  - numpy
+  - matplotlib
+  - pytorch
+  - cpuonly
+  - opencv
+  - paramiko
+  - pip
+  - pip:
+    - ultralytics
+    - pyniryo
