@@ -19,7 +19,6 @@
 
 # Standard modules import
 import sys
-import copy
 import numpy as np
 import cv2
 import math
@@ -28,10 +27,7 @@ import chess
 import chess.engine
 
 # Niryo modules import for Ned2 movements
-from pyniryo import NiryoRobot, PoseObject, RobotAxis, uncompress_image, show_img
-
-# IA imports
-import torch
+from pyniryo import NiryoRobot, PoseObject, RobotAxis
 
 # Utils imports (workspace gathering / image to board transcription funcs etc.)
 sys.path.append("ChessUtils")
@@ -43,10 +39,7 @@ from ChessUtils import (
     create_virtual_detection_grid,
     detect_colored_stickers,
     board_state_from_colored_stickers,
-    ChessNet,
     Img_treatment,
-    UCT_search,
-    do_decode_n_move_pieces,
     COLOR_RANGES
 
 )
@@ -863,10 +856,6 @@ def main():
     dims = None  # Dimensions de l'échiquier warpé
 
     # AI model loading
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # net = ChessNet().to(device).eval()
-    # ckpt = torch.load("src/ChessUtils/model_data/current_net_trained_iter2.pth.tar", map_location=device, weights_only=True)
-    # net.load_state_dict(ckpt['state_dict'])
     STOCKFISH_PATH = "src/ChessUtils/model_data/stockfish/stockfish-macos-m1-apple-silicon"
     engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
     print("Modèle IA chargé")
