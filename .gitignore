@@ -1,5 +1,8 @@
 __pycache__/
 Archives/
+Audio/
+assets/
+doc_fr/
 *.pyc
 .venv/
 .env
