@@ -49,14 +49,12 @@ from ChessUtils import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 ROBOT_IP = '169.254.200.200' # Direct Ethernet
-
-NUM_READS = 200
+CAMERA_ID = 0
 CELL_SIZE = 0.04  # 4 cm
 ELECTROMAGNET_PIN = 'DO4'
-ELECTROMAGNET_ELEVATION_COEFF = 0.029
-CAMERA_ID = 0
 BOARD_SIZE = CELL_SIZE*8   # m
-OFFSET_M = 0.005   # 5 mm
+BOARD_THICKNESS = 0.013  # Épaisseur du plateau en m
+
 COORD_BASE_MM = np.array([
     [436, -148],
     [442, 126],
@@ -66,39 +64,67 @@ COORD_BASE_MM = np.array([
 PTS_IDEAUX = np.array([[0, 0],[7, 0],[0, 7],[7, 7]], dtype=np.float32)
 H, _ = cv2.findHomography(PTS_IDEAUX, COORD_BASE_MM)
 
-# Individual pieces heights (Change this to your pieces heights if you cloned..
-# ..this repo and changed STLs files) in meters
+# Individual pieces heights in m
 PIECE_HEIGHTS = {
     'P': 0.042, 'p': 0.042,
     'N': 0.053, 'n': 0.053,
     'B': 0.055, 'b': 0.055,
     'R': 0.047, 'r': 0.047,
     'Q': 0.062, 'q': 0.062,
-    'K': 0.075, 'k': 0.075,
+    'K': 0.074, 'k': 0.074,
 }
+
 SHIFT_DIST = 0.015       # Distance de sécurité
 SHIFT_DIST_EMPTY  = PIECE_HEIGHTS['k'] + SHIFT_DIST # Distance de déplacement à vide (au dessus de la plus grande pièce)
-BOARD_THICKNESS = 0.014  # Épaisseur du plateau en m
 
-FRAME_COUNT = 8
-CONFIRM_RATIO = 0.6           
-MIN_CONFIRM = int(FRAME_COUNT * CONFIRM_RATIO)
+FRAME_COUNT = 8        
+MIN_CONFIRM = int(FRAME_COUNT * 0.6)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPER
+# HELPER FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
-def game_result(b: ChessBoard):
-    """'mat', 'pat' or None if game continues."""
-    if b.actions():
-        return None
-    return 'mat' if b.check_status() else 'pat'
-
 def square_to_index(sq: str):
     """Ex. 'e2' → (6,4) (line i, column j in current_board)."""
     file, rank = sq[0], int(sq[1])
     j = ord(file) - ord('a')
     i = 8 - rank
     return i, j
+
+def index_to_square(i, j):
+    """Convertit des indices (i:0–7, j:0–7) en case algébrique, ex. (7,4) → 'e1'."""
+    file = chr(ord('a') + j)
+    rank = str(8 - i)
+    return file + rank
+
+def case_center(i, j):
+    pt = np.array([[[i, j]]], dtype=np.float32)
+    res = cv2.perspectiveTransform(pt, H)
+    return np.array([res[0,0,0], res[0,0,1]], dtype=np.float32)
+
+def chess_square_to_rel(square: str, player_plays_white=True):
+    """
+    Convertit une case d'échecs ('a1', 'e4', 'h8') en (x_rel, y_rel)
+    en position pour robot.move()
+    """
+
+    square = square.lower().strip()
+    file = square[0]   # 'a' .. 'h'
+    rank = square[1]   # '1' .. '8'
+
+    # Indices 0..7
+    i = ord(file) - ord('a')        # a=0 ... h=7
+    j = int(rank) - 1              # 8=0 (a8), 1=7 (a1)
+
+    if not player_plays_white:
+        # On retourne le plateau
+        i = 7 - i
+        j = 7 - j
+
+
+    # Coordonnées relatives dans le workspace
+    x_mm, y_mm = case_center(i, j)
+
+    return x_mm*0.001, y_mm*0.001
 
 def init_sticky_state(boxes):
     sticky = {}
@@ -110,10 +136,170 @@ def init_sticky_state(boxes):
         }
     return sticky
 
+def update_sticky_state(sticky_state, detections):
+    """Met à jour l'état lissé avec les nouvelles détections"""
+    for cell, detected in detections.items():
+        state = sticky_state[cell]
+        stable = state["stable"]
+        candidate = state["candidate"]
+
+        # Cas stable confirmé
+        if detected == stable:
+            state["candidate"] = None
+            state["count"] = 0
+            continue
+
+        if detected == " " and stable != " ":
+            state["count"] += 1
+
+        # Nouveau candidat
+        if detected != candidate:
+            state["candidate"] = detected
+            state["count"] = 1
+        else:
+            state["count"] += 1
+
+        # Validation du changement
+        if state["count"] >= MIN_CONFIRM:
+            state["stable"] = state["candidate"]
+            state["candidate"] = None
+            state["count"] = 0
+    
+    return sticky_state
+
+def get_stable_board_state(sticky_state):
+    return {cell: data["stable"] for cell, data in sticky_state.items()}
+
+def dict_to_board_matrix(state):
+    """
+    Transforme un dictionnaire {'a1': 'p'} en matrice 8x8
+    avec [0,0] = a8 et [7,7] = h1
+    """
+    board = [[" " for _ in range(8)] for _ in range(8)]
+
+    for square, piece in state.items():
+        if square is None:
+            continue
+
+        file = ord(square[0]) - ord('a')      # a→0, b→1, ...
+        rank = int(square[1])                  # '1' → 1
+        row = 8 - rank                         # 8→0, 1→7
+        col = file
+
+        board[row][col] = piece if piece is not None else " "
+
+    return board
+
 def stockfish_move_to_robot(move):
     from_sq = chess.square_name(move.from_square)
     to_sq = chess.square_name(move.to_square)
     return from_sq, to_sq
+
+def board_to_matrix(board: chess.Board):
+    """
+    Convertit un chess.Board en matrice 8x8 compatible vision
+    [0][0] = a8, [7][7] = h1
+    """
+    matrix = [[" " for _ in range(8)] for _ in range(8)]
+
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece:
+            row = 7 - chess.square_rank(square)
+            col = chess.square_file(square)
+            matrix[row][col] = piece.symbol()
+
+    return matrix
+# ─────────────────────────────────────────────────────────────────────────────
+# VISION -> PYTHON-CHESS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_move_from_matrices(
+    before: np.ndarray, 
+    after: np.ndarray,
+    board: chess.Board
+) -> tuple:
+    """
+    Détecte le coup joué en comparant deux matrices.
+    
+    Returns:
+        (chess.Move, piece_moved, captured_piece) ou (None, None, None)
+    """
+    diffs = []
+    for i in range(8):
+        for j in range(8):
+            if before[i, j] != after[i, j]:
+                diffs.append((i, j))
+    
+    if len(diffs) == 0:
+        return None, None, None
+    
+    # Détection du roque (4 cases changées)
+    if len(diffs) == 4:
+        # Petit roque blanc
+        if (7,4) in diffs and (7,6) in diffs and before[7,4]=='K' and after[7,6]=='K':
+            move = chess.Move.from_uci("e1g1")
+            if move in board.legal_moves:
+                return move, 'K', None
+        
+        # Grand roque blanc
+        if (7,4) in diffs and (7,2) in diffs and before[7,4]=='K' and after[7,2]=='K':
+            move = chess.Move.from_uci("e1c1")
+            if move in board.legal_moves:
+                return move, 'K', None
+        
+        # Petit roque noir
+        if (0,4) in diffs and (0,6) in diffs and before[0,4]=='k' and after[0,6]=='k':
+            move = chess.Move.from_uci("e8g8")
+            if move in board.legal_moves:
+                return move, 'k', None
+        
+        # Grand roque noir
+        if (0,4) in diffs and (0,2) in diffs and before[0,4]=='k' and after[0,2]=='k':
+            move = chess.Move.from_uci("e8c8")
+            if move in board.legal_moves:
+                return move, 'k', None
+    
+    # Coup simple : trouver départ et arrivée
+    from_pos = None
+    to_pos = None
+    piece_moved = None
+    captured = None
+    
+    for i, j in diffs:
+        # Case qui se vide → départ
+        if before[i, j] != ' ' and after[i, j] == ' ':
+            from_pos = (i, j)
+            piece_moved = before[i, j]
+        # Case qui se remplit → arrivée
+        elif before[i, j] == ' ' and after[i, j] != ' ':
+            to_pos = (i, j)
+        # Case qui change de pièce → capture
+        elif before[i, j] != ' ' and after[i, j] != ' ' and before[i, j] != after[i, j]:
+            # C'est la case d'arrivée
+            if after[i, j] != ' ':
+                to_pos = (i, j)
+                captured = before[i, j]
+    
+    if from_pos is None or to_pos is None:
+        return None, None, None
+    
+    # Conversion en notation UCI
+    from_square = chess.square(from_pos[1], 7 - from_pos[0])
+    to_square = chess.square(to_pos[1], 7 - to_pos[0])
+    
+    # Tester le coup normal
+    move = chess.Move(from_square, to_square)
+    if move in board.legal_moves:
+        return move, piece_moved, captured
+    
+    # Tester les promotions
+    for promotion in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
+        move_promo = chess.Move(from_square, to_square, promotion)
+        if move_promo in board.legal_moves:
+            return move_promo, piece_moved, captured
+    
+    return None, None, None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAMERA FUNCTIONS
@@ -197,90 +383,69 @@ def detect_board(frame):
 
     return boxes, virtual_boxes, board_detected, M, dims
 
-# ─────────────────────────────────────────────────────────────────────────────
-# X, Y, Z TILES & BUFFERS' POSES CALCULATION FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────────────
-def case_center(i, j):
-    pt = np.array([[[i, j]]], dtype=np.float32)
-    res = cv2.perspectiveTransform(pt, H)
-    return np.array([res[0,0,0], res[0,0,1]], dtype=np.float32)
+def process_frame(frame, M, dims, boxes, virtual_boxes, sticky_state):
+        """
+        Traite une frame : détection et lissage.
+        
+        Args:
+            frame: Image BGR capturée depuis la caméra
+        
+        Returns:
+            dict: État lissé de l'échiquier {cell_name: letter}
+        """
+        # Warper la frame courante avec la même matrice que la détection initiale
+        # print(f"OK: {sticky_state['f4']}")
+        warp_frame = cv2.warpPerspective(frame, M, dims)
+        
+        # Appliquer le MÊME traitement d'image que dans test_image_to_board.py
+        img_treatment = Img_treatment.ImgTreatment(warp_frame)
+        treated_frame, _ = img_treatment.traitement_image()
+        
+        # Détecter les gommettes colorées dans les cases virtuelles
+        detections = detect_colored_stickers(
+            treated_frame,
+            virtual_boxes,
+            min_area_percent=50,
+            color_ranges=COLOR_RANGES
+        )
+        
+        frame_detections = {}
 
-def chess_square_to_rel(square: str, player_plays_white=True):
-    """
-    Convertit une case d'échecs ('a1', 'e4', 'h8') en (x_rel, y_rel)
-    en position pour robot.move()
-    """
+        for cell_name in boxes.keys():
+            info = detections.get(cell_name)
 
-    square = square.lower().strip()
-    file = square[0]   # 'a' .. 'h'
-    rank = square[1]   # '1' .. '8'
+            # if info is None:
+            #     frame_detections[cell_name] = None
+            #     continue
 
-    # Indices 0..7
-    i = ord(file) - ord('a')        # a=0 ... h=7
-    j = int(rank) - 1              # 8=0 (a8), 1=7 (a1)
+            color = info.get("color")
+            side = info.get("side")
 
-    if not player_plays_white:
-        # On retourne le plateau
-        i = 7 - i
-        j = 7 - j
+            if color is not None and side is not None:
+                frame_detections[cell_name] = board_state_from_colored_stickers(color, side)
+            else:
+                frame_detections[cell_name] = " "
+        
+        # Récupérer l'état lissé
+        update_sticky_state(sticky_state, frame_detections)
 
+def capture_and_get_state(cap, boxes, virtual_boxes, M, dims, sticky_state):
+    """Capture plusieurs frames et retourne l'état lissé"""
+    for _ in range(FRAME_COUNT):
+        ret, frame = cap.read()
+        if not ret:
+            print("[ERROR] Impossible de capturer.")
+            break
 
-    # Coordonnées relatives dans le workspace
-    x_mm, y_mm = case_center(i, j)
+        process_frame(frame, M, dims, boxes, virtual_boxes, sticky_state)
 
-    return x_mm*0.001, y_mm*0.001
-
-def set_buffer_tiles_positions(buffer_tiles, cell_size=CELL_SIZE):
-    """
-    Compute and assign a PoseObject to each buffer slot around the board, based on a reference pose and square size.
-
-    Inputs:
-        buffer_tiles (dict[str, PoseObject]) – mapping from buffer slot names (e.g. "1 1", "1 2", ..., "4 4") to PoseObject placeholders.
-        cell_size (float) – size of one chessboard square in meters, used to space buffer slots.
-
-    Outputs:
-        dict[str, PoseObject] – the same buffer_tiles dict, with each entry set to a PoseObject at the correct (x, y, z, roll, pitch, yaw) for that slot.
-    """
-    for ci, c in enumerate('1234'):
-        for ri, r in enumerate('1234'):
-            if c == '1':
-                pos_x, pos_y = case_center(0,7)
-                pos_x, pos_y = pos_x*0.001, pos_y*0.001
-                pos_y -= cell_size
-                dx = ri * cell_size
-                dy = 0
-            elif c == '2':
-                pos_x, pos_y = case_center(0,7)
-                pos_x, pos_y = pos_x*0.001, pos_y*0.001
-                pos_x -= cell_size
-                dx = 0
-                dy = ri * cell_size
-            elif c == '3':
-                pos_x, pos_y = case_center(4,7)
-                pos_x, pos_y = pos_x*0.001, pos_y*0.001
-                pos_x -= cell_size
-                dx = 0
-                dy = ri * cell_size
-            elif c == '4' :
-                pos_x, pos_y = case_center(7,7)
-                pos_x, pos_y = pos_x*0.001, pos_y*0.001
-                pos_y += cell_size
-                dx = ri * cell_size
-                dy = 0
-            # print(f"Position {c}{r} : pos_x = {pos_x}, pos_y = {pos_y}, coordonnées buffer : ({pos_x + dx}; {pos_y + dy})")
-            buffer_tiles[f"{c}{r}"] = PoseObject(pos_x + dx, pos_y + dy, BOARD_THICKNESS + SHIFT_DIST_EMPTY, 0.00, math.pi/2, 0.00)
-    return buffer_tiles
-
-def wait_player_move(matrix_current, capture_fn):
-    """
-    Attend qu'un joueur humain ait effectué un coup valide.
+    stable_state = get_stable_board_state(sticky_state)
+    board_state_matrix = dict_to_board_matrix(stable_state)
     
-    - Compare sans tenir compte de la casse pour détecter les changements
-    - Vérifie le type exact de pièce pour connaître le pion déplacé
-    - Recommence si plus de 2 changements détectés
-    - Utilise une moyenne sur max_frames pour stabiliser la capture
-    """
-    
+    return board_state_matrix
+
+def wait_player_move(board, matrix_current, capture_fn):
+    """Attend qu'un coup humain valide soit détecté"""
     valid_move = False
 
     while not valid_move:
@@ -296,38 +461,41 @@ def wait_player_move(matrix_current, capture_fn):
                 before = matrix_current[r][c]
                 after = matrix_detected[r][c]
 
-                # Départ
                 if before != " " and after == " ":
                     removed.append((r, c, before))
-
-                # Arrivée sur case vide
                 elif before == " " and after != " ":
                     added.append((r, c, after))
 
-                # Case occupée avant ET après → possible prise
-                elif before != " " and after != " ":
-                    if before != after :
-                        replaced.append((r, c, before, after))
+                elif before != " " and after != " " and before != after :
+                    replaced.append((r, c, before, after))
 
-        # ─────────────────────────────
-        # Rien n'a bougé
+        if len(removed) == 2 and len(added) == 2:
+            removed_squares = {(r, c) for r, c, _ in removed}
+            added_squares   = {(r, c) for r, c, _ in added}
+
+            for move in board.legal_moves:
+                if board.is_castling(move):
+                    from_sq = square_to_index(chess.square_name(move.from_square))
+                    to_sq   = square_to_index(chess.square_name(move.to_square))
+
+                    if from_sq in removed_squares and to_sq in added_squares:
+                        print("Roque détecté")
+                        board.push(move)
+                        return board_to_matrix(board)
+
+        # Vérifications de validité
         if not removed and not added and not replaced:
             print("Pas encore bougé…")
             continue
 
-        # ─────────────────────────────
-        # Disparition isolée → bruit / main du joueur
         if len(removed) == 1 and not added and not replaced:
             print("Disparition isolée détectée → nouvelle capture")
             continue
         
-        # ─────────────────────────────
-        # Faux positif de vision : changement de casse sans déplacement
         if not removed and len(replaced) == 1:
             print("Changement de casse isolé → ignoré")
             continue
 
-        # ─────────────────────────────
         # Déplacement simple
         if len(removed) == 1 and len(added) == 1 and not replaced:
             r_from, c_from, piece = removed[0]
@@ -338,87 +506,27 @@ def wait_player_move(matrix_current, capture_fn):
             matrix_new[r_to][c_to] = piece  # casse LOGIQUE conservée
 
             valid_move = True
-
-            moves = {
-                "type": "move",
-                "from": (r_from, c_from),
-                "to": (r_to, c_to),
-                "piece": piece
-            }
-
             print(f"Coup détecté : {piece}@({r_from},{c_from}) → ({r_to},{c_to})")
-            break
+            return matrix_new
 
-        # ─────────────────────────────
         # Prise
         if len(removed) == 1 and len(replaced) == 1 and not added:
             r_from, c_from, piece = removed[0]
-            r_to, c_to, victim, detected_piece = replaced[0]
+            r_to, c_to, victim, detected = replaced[0]
 
-            # La logique décide de la pièce déplacée
-            piece_final = piece
-
-            # La vision peut corriger la casse UNIQUEMENT si cohérente
-            if detected_piece.lower() == piece.lower():
-                piece_final = detected_piece
+            piece_final = detected if detected.lower() == piece.lower() else piece
 
             matrix_new = [row.copy() for row in matrix_current]
             matrix_new[r_from][c_from] = " "
             matrix_new[r_to][c_to] = piece_final
 
             valid_move = True
+            print(f"Prise détectée : {piece_final} x {victim} sur {index_to_square(r_from,c_from)} ")
+            return matrix_new
 
-            moves = {
-                "type": "capture",
-                "from": (r_from, c_from),
-                "to": (r_to, c_to),
-                "piece": piece_final,
-                "captured": victim
-            }
-
-            print(
-                f"Prise détectée : {piece_final}@({r_from},{c_from}) "
-                f"x {victim}@({r_to},{c_to})"
-            )
-            break
-
-        # ─────────────────────────────
-        # Tout le reste → instable
-        print("Coup incohérent ou instable → nouvelle capture")
+        print("Coup instable → nouvelle capture")
         print(np.array(matrix_detected))
         continue
-
-    return matrix_new, moves
-
-# def wait_player_move(matrix_state_current, matrix_state_post, capture_fn):
-    """
-    Wait until the human has moved by repeatedly capturing and averaging board states.
-
-    Inputs:
-        robot (NiryoRobot) – robot instance for timing and pose adjustments.
-        matrix_state_current (list[list[str]] or np.ndarray) – the previous stable board matrix.
-        matrix_state_post (list[list[str]] or np.ndarray or None) – initial post-capture matrix or None if a hand was detected.
-        capture_fn (callable) – function to perform a stabilized capture returning (image, matrix, yolo_result).
-
-    Outputs:
-        matrix_state_post (list[list[str]]) – the first averaged board matrix that differs from matrix_state_current.
-    """
-
-    # Tant qu'on détecte une main ou que l'échiquier est inchangé, on refait une moyenne
-    print("MATRIX STATE CURRENT")
-    print(matrix_state_current)
-    print("MATRIX STATE POST")
-    print(matrix_state_post)
-    while (matrix_state_post is None) or np.array_equal(matrix_state_current, matrix_state_post):
-        if matrix_state_post is None:
-            print("Main détectée")
-        if matrix_state_post is not None and np.array_equal(matrix_state_current, matrix_state_post):
-            print("Pas encore bougé")
-
-        matrix_state_post = capture_fn()
-
-    print("Nouvelle position jouée")
-    return matrix_state_post
 
 def player_has_white(corners, yolo_result):
     """
@@ -483,209 +591,51 @@ def player_has_white(corners, yolo_result):
     # alors le joueur prendra les pièces blanches
     return min_dist_white < min_dist_black
 
-def process_frame(frame, M, dims, boxes, virtual_boxes, sticky_state):
-        """
-        Traite une frame : détection et lissage.
-        
-        Args:
-            frame: Image BGR capturée depuis la caméra
-        
-        Returns:
-            dict: État lissé de l'échiquier {cell_name: letter}
-        """
-        # Warper la frame courante avec la même matrice que la détection initiale
-        # print(f"OK: {sticky_state['f4']}")
-        warp_frame = cv2.warpPerspective(frame, M, dims)
-        
-        # Appliquer le MÊME traitement d'image que dans test_image_to_board.py
-        img_treatment = Img_treatment.ImgTreatment(warp_frame)
-        treated_frame, _ = img_treatment.traitement_image()
-        
-        # Détecter les gommettes colorées dans les cases virtuelles
-        detections = detect_colored_stickers(
-            treated_frame,
-            virtual_boxes,
-            min_area_percent=50,
-            color_ranges=COLOR_RANGES
-        )
-        
-        frame_detections = {}
-
-        for cell_name in boxes.keys():
-            info = detections.get(cell_name)
-
-            # if info is None:
-            #     frame_detections[cell_name] = None
-            #     continue
-
-            color = info.get("color")
-            side = info.get("side")
-
-            if color is not None and side is not None:
-                frame_detections[cell_name] = board_state_from_colored_stickers(color, side)
-            else:
-                frame_detections[cell_name] = " "
-        
-        # Récupérer l'état lissé
-        new_sticky_state = update_sticky_state(sticky_state, frame_detections)
-        stable_board_state = get_stable_board_state(new_sticky_state)
-        
-        return stable_board_state
-
-def update_sticky_state(sticky_state, detections):
-    """
-    detections : dict {cell_name: detected_letter or None}
-    """
-    for cell, detected in detections.items():
-        state = sticky_state[cell]
-        stable = state["stable"]
-        candidate = state["candidate"]
-
-        # Cas stable confirmé
-        if detected == stable:
-            state["candidate"] = None
-            state["count"] = 0
-            continue
-
-        # Ignorer None si stable existe (raté ponctuel)
-        if detected == " " and stable != " ":
-            state["count"] += 1
-
-
-        # Nouveau candidat
-        if detected != candidate:
-            state["candidate"] = detected
-            state["count"] = 1
-        else:
-            state["count"] += 1
-
-        # Validation du changement
-        if state["count"] >= MIN_CONFIRM:
-            state["stable"] = state["candidate"]
-            state["candidate"] = None
-            state["count"] = 0
-    
-    return sticky_state
-
-def get_stable_board_state(sticky_state):
-    return {cell: data["stable"] for cell, data in sticky_state.items()}
-
-# def get_smoothed_state(boxes, detection_history):
-    """
-    Retourne l'état de l'échiquier lissé avec une méthode robuste basée sur :
-    1. Un seuil de majorité stricte (min 70% des frames)
-    2. Exclusion des détections None (cases vides)
-    3. Nécessité d'une cohérence minimale
-    
-    Returns:
-        dict: {cell_name: letter} où letter est stable et fiable
-    """
-    smoothed_state = {}
-    min_confidence_threshold = 0.70  # Demande 70% de consensus minimum
-    
-    for cell_name in boxes.keys():
-        history = detection_history[cell_name]
-        
-        if not history:
-            smoothed_state[cell_name] = None
-            continue
-        
-        # Compter les occurrences de chaque détection
-        vote_counts = defaultdict(int)
-        for detection in history:
-            vote_counts[detection] += 1
-        
-        # Obtenir le total et la meilleure détection
-        total_votes = len(history)
-        
-        if not vote_counts:
-            smoothed_state[cell_name] = None
-            continue
-        
-        # Trouver la détection avec le plus de votes (excluant None)
-        non_none_votes = {k: v for k, v in vote_counts.items() if k is not None}
-        
-        if not non_none_votes:
-            # Aucune détection non-None dans l'historique
-            smoothed_state[cell_name] = None
-            continue
-        
-        # Prendre la meilleure détection parmi les non-None
-        best_detection = max(non_none_votes.items(), key=lambda x: x[1])[0]
-        best_vote_count = non_none_votes[best_detection]
-        confidence = best_vote_count / total_votes
-        
-        # Appliquer le seuil de confiance : accepter seulement si confiance >= 70%
-        if confidence >= min_confidence_threshold:
-            smoothed_state[cell_name] = best_detection
-        else:
-            # Pas assez de consensus → rester None (case vide)
-            smoothed_state[cell_name] = None
-    
-    return smoothed_state
-
-def dict_to_board_matrix(state):
-    """
-    Transforme un dictionnaire {'a1': 'p'} en matrice 8x8
-    avec [0,0] = a8 et [7,7] = h1
-    """
-    board = [[" " for _ in range(8)] for _ in range(8)]
-
-    for square, piece in state.items():
-        if square is None:
-            continue
-
-        file = ord(square[0]) - ord('a')      # a→0, b→1, ...
-        rank = int(square[1])                  # '1' → 1
-
-        row = 8 - rank                         # 8→0, 1→7
-        col = file
-
-        board[row][col] = piece if piece is not None else " "
-
-    return board
-
-def matrix_to_fen(matrix, side_to_move):
-    fen_rows = []
-    for row in matrix:
-        empty = 0
-        fen_row = ""
-        for cell in row:
-            if cell == " ":
-                empty += 1
-            else:
-                if empty:
-                    fen_row += str(empty)
-                    empty = 0
-                fen_row += cell
-        if empty:
-            fen_row += str(empty)
-        fen_rows.append(fen_row)
-
-    fen = "/".join(fen_rows)
-    fen += f" {'w' if side_to_move == 0 else 'b'} - - 0 1"
-    return fen
-
-def capture_and_get_state(cap, boxes, virtual_boxes, M, dims, sticky_state):
-    frame_count = 0
-    
-    while frame_count < FRAME_COUNT:
-        ret, frame = cap.read()
-        if not ret:
-            print("[ERROR] Impossible de capturer.")
-            break
-        
-        # Traiter la frame
-        board_state = process_frame(frame, M, dims, boxes, virtual_boxes, sticky_state)
-        frame_count += 1
-
-    board_state_matrix = dict_to_board_matrix(board_state)
-    
-    return board_state_matrix
-
 # ─────────────────────────────────────────────────────────────────────────────
-# ROBOT MOVES FUNCTIONS (pickup, place, capture are encapsulated in play_move)
+# ROBOTS
 # ─────────────────────────────────────────────────────────────────────────────
+
+def set_buffer_tiles_positions(buffer_tiles, cell_size=CELL_SIZE):
+    """
+    Compute and assign a PoseObject to each buffer slot around the board, based on a reference pose and square size.
+
+    Inputs:
+        buffer_tiles (dict[str, PoseObject]) – mapping from buffer slot names (e.g. "1 1", "1 2", ..., "4 4") to PoseObject placeholders.
+        cell_size (float) – size of one chessboard square in meters, used to space buffer slots.
+
+    Outputs:
+        dict[str, PoseObject] – the same buffer_tiles dict, with each entry set to a PoseObject at the correct (x, y, z, roll, pitch, yaw) for that slot.
+    """
+    for ci, c in enumerate('1234'):
+        for ri, r in enumerate('1234'):
+            if c == '1':
+                pos_x, pos_y = case_center(0,7)
+                pos_x, pos_y = pos_x*0.001, pos_y*0.001
+                pos_y -= cell_size
+                dx = ri * cell_size
+                dy = 0
+            elif c == '2':
+                pos_x, pos_y = case_center(0,7)
+                pos_x, pos_y = pos_x*0.001, pos_y*0.001
+                pos_x -= cell_size
+                dx = 0
+                dy = ri * cell_size
+            elif c == '3':
+                pos_x, pos_y = case_center(4,7)
+                pos_x, pos_y = pos_x*0.001, pos_y*0.001
+                pos_x -= cell_size
+                dx = 0
+                dy = ri * cell_size
+            elif c == '4' :
+                pos_x, pos_y = case_center(7,7)
+                pos_x, pos_y = pos_x*0.001, pos_y*0.001
+                pos_y += cell_size
+                dx = ri * cell_size
+                dy = 0
+            # print(f"Position {c}{r} : pos_x = {pos_x}, pos_y = {pos_y}, coordonnées buffer : ({pos_x + dx}; {pos_y + dy})")
+            buffer_tiles[f"{c}{r}"] = PoseObject(pos_x + dx, pos_y + dy, BOARD_THICKNESS + SHIFT_DIST_EMPTY, 0.00, math.pi/2, 0.00)
+    
+    return buffer_tiles
 
 def pickup_with_electromagnet(robot, position, piece_type):
     """
@@ -732,115 +682,101 @@ def place_with_electromagnet(robot, position, piece_type):
     robot.wait(1)
     robot.shift_pose(RobotAxis.Z,  SHIFT_DIST_EMPTY-h)
 
-def capture_piece(robot, pick_pose, target_pose, piece_type):
-    """
-    Perform a capture by picking up a piece from one position and placing it at another using the electromagnet.
-
-    Inputs:
-        robot (NiryoRobot) – the robot instance controlling movement and electromagnet.
-        pick_pose (PoseObject) – pose above the square of the piece to capture.
-        target_pose (PoseObject) – pose above the destination square (buffer or opponent square).
-        piece_type (str) – one-character code for the piece (e.g. 'P', 'n'), used to look up its height.
-
-    Outputs:
-        None – the robot executes a pickup then place sequence to move the captured piece.
-    """
-
-    pickup_with_electromagnet(robot, pick_pose, piece_type)
-    place_with_electromagnet(robot, target_pose, piece_type)
-
-def play_move(
-    robot: NiryoRobot,
-    from_sq: tuple,
-    to_sq: tuple,
-    move_type: str,
-    tiles_positions: dict,
+def execute_move(
+    robot, 
+    move: chess.Move, 
+    board: chess.Board,
+    piece_moved: str,
+    captured_piece: str,
+    board_tiles: dict,
     buffer_positions: dict,
     buffer_state: dict
 ):
     """
-    Execute a chess move physically with the robot, handling normal moves, captures (with buffering), and all castling cases.
-
-    Inputs:
-        robot (NiryoRobot) – the robot instance controlling motions and electromagnet.
-        from_sq (tuple) – (piece_type, origin_square), e.g. ('P', 'e2').
-        to_sq (tuple) – (captured_or_moved_piece, destination_square), e.g. ('p', 'd5') or ('P', 'e4').
-        move_type (str or None) – None for a quiet move; square name for captures; 'O-O', 'O-O-O', 'o-o', 'o-o-o' for castling.
-        tiles_positions (dict[str, PoseObject]) – mapping of board squares to robot poses.
-        buffer_positions (dict[str, PoseObject]) – mapping of buffer slots to robot poses.
-        buffer_state (dict[str, str or None]) – tracks which buffer slots are occupied by which piece.
-
-    Outputs:
-        None – the robot performs the necessary pickup, placement, and buffer operations to realize the move.
+    Exécute physiquement un coup avec le robot.
+    
+    Args:
+        move: Le coup chess.Move à jouer
+        piece_moved: La pièce déplacée ('P', 'n', etc.)
+        captured_piece: La pièce capturée ou None
+        board: chess.Board pour détecter les roques
     """
-
-    # (1) Traitement du roque (4 cas)
-    if move_type == 'O-O':
-        # Petit roque blanc
-        pickup_with_electromagnet(robot, tiles_positions['h1'], 'r')
-        place_with_electromagnet(robot, tiles_positions['f1'], 'r')
-        pickup_with_electromagnet(robot, tiles_positions['e1'], 'k')
-        place_with_electromagnet(robot, tiles_positions['g1'], 'k')
-
-    elif move_type == 'O-O-O':
-        # Grand roque blanc
-        pickup_with_electromagnet(robot, tiles_positions['a1'], 'r')
-        place_with_electromagnet(robot, tiles_positions['d1'], 'r')
-        pickup_with_electromagnet(robot, tiles_positions['e1'], 'k')
-        place_with_electromagnet(robot, tiles_positions['c1'], 'k')
-
-    elif move_type == 'o-o':
-        # Petit roque noir
-        pickup_with_electromagnet(robot, tiles_positions['h8'], 'r')
-        place_with_electromagnet(robot, tiles_positions['f8'], 'r')
-        pickup_with_electromagnet(robot, tiles_positions['e8'], 'k')
-        place_with_electromagnet(robot, tiles_positions['g8'], 'k')
-
-    elif move_type == 'o-o-o':
-        # Grand roque noir
-        pickup_with_electromagnet(robot, tiles_positions['a8'], 'r')
-        place_with_electromagnet(robot, tiles_positions['d8'], 'r')
-        pickup_with_electromagnet(robot, tiles_positions['e8'], 'k')
-        place_with_electromagnet(robot, tiles_positions['c8'], 'k')
-
-    # (2) Coup normal (move_type None)
-    elif move_type is None:
-        piece_type_to_move, pick_tile = from_sq
-        print(f"OK: {piece_type_to_move}")
-        _, place_tile = to_sq
-        pickup_with_electromagnet(robot, tiles_positions[pick_tile], piece_type_to_move)
-        place_with_electromagnet(robot, tiles_positions[place_tile], piece_type_to_move)
-
-    # (3) Coup de prise (move_type contient 'd5' par ex.)
-    else:
-        piece_to_move_type, piece_to_move_tile = from_sq
-        piece_to_capture_type, piece_to_place_tile = to_sq
-        captured_tile = move_type  # par ex. 'd5'
-
-        # 3.1) Trouve la première case libre du buffer
+    from_square = chess.square_name(move.from_square)
+    to_square = chess.square_name(move.to_square)
+    
+    # Détection du roque
+    if board.is_castling(move):
+        # Identifier quel roque
+        if to_square == 'g1':  # Petit roque blanc
+            pickup_with_electromagnet(robot, board_tiles['h1'], 'R')
+            place_with_electromagnet(robot, board_tiles['f1'], 'R')
+            pickup_with_electromagnet(robot, board_tiles['e1'], 'K')
+            place_with_electromagnet(robot, board_tiles['g1'], 'K')
+        
+        elif to_square == 'c1':  # Grand roque blanc
+            pickup_with_electromagnet(robot, board_tiles['a1'], 'R')
+            place_with_electromagnet(robot, board_tiles['d1'], 'R')
+            pickup_with_electromagnet(robot, board_tiles['e1'], 'K')
+            place_with_electromagnet(robot, board_tiles['c1'], 'K')
+        
+        elif to_square == 'g8':  # Petit roque noir
+            pickup_with_electromagnet(robot, board_tiles['h8'], 'r')
+            place_with_electromagnet(robot, board_tiles['f8'], 'r')
+            pickup_with_electromagnet(robot, board_tiles['e8'], 'k')
+            place_with_electromagnet(robot, board_tiles['g8'], 'k')
+        
+        elif to_square == 'c8':  # Grand roque noir
+            pickup_with_electromagnet(robot, board_tiles['a8'], 'r')
+            place_with_electromagnet(robot, board_tiles['d8'], 'r')
+            pickup_with_electromagnet(robot, board_tiles['e8'], 'k')
+            place_with_electromagnet(robot, board_tiles['c8'], 'k')
+        
+        return
+    
+    # Gestion des captures
+    if captured_piece is not None or board.is_capture(move):
+        # Trouver un buffer libre
         free_buffer = None
         for buf_tile, occupant in buffer_state.items():
             if occupant is None:
                 free_buffer = buf_tile
                 break
+        
         if free_buffer is None:
-            raise RuntimeError("Buffer plein ! Impossible de stocker la pièce capturée.")
-
-        # 3.2) On capture la pièce vers le buffer
-        capture_piece(robot,
-                      tiles_positions[captured_tile],
-                      buffer_positions[free_buffer],
-                      piece_to_capture_type)
-        buffer_state[free_buffer] = piece_to_capture_type
-
-        # 3.3) On déplace la pièce captante sur la case désormais libre
-        pickup_with_electromagnet(robot,
-                                  tiles_positions[piece_to_move_tile],
-                                  piece_to_move_type)
-        place_with_electromagnet(robot,
-                                 tiles_positions[piece_to_place_tile],
-                                 piece_to_move_type)
-
+            raise RuntimeError("Buffer plein !")
+        
+        # Identifier la pièce capturée
+        if captured_piece:
+            piece_to_capture = captured_piece
+        else:
+            # En passant ou autre cas
+            captured_square = chess.square_name(move.to_square)
+            i, j = square_to_index(captured_square)
+            piece_to_capture = board.piece_at(move.to_square)
+            if piece_to_capture:
+                piece_to_capture = piece_to_capture.symbol()
+            else:
+                piece_to_capture = 'p' if board.turn == chess.WHITE else 'P'
+        
+        # Déplacer la pièce capturée au buffer
+        pickup_with_electromagnet(robot, board_tiles[to_square], piece_to_capture)
+        place_with_electromagnet(robot, buffer_positions[free_buffer], piece_to_capture)
+        buffer_state[free_buffer] = piece_to_capture
+    
+    # Déplacement normal
+    pickup_with_electromagnet(robot, board_tiles[from_square], piece_moved)
+    
+    # Gestion de la promotion
+    if move.promotion:
+        promotion_map = {
+            chess.QUEEN: 'Q' if board.turn == chess.BLACK else 'q',
+            chess.ROOK: 'R' if board.turn == chess.BLACK else 'r',
+            chess.BISHOP: 'B' if board.turn == chess.BLACK else 'b',
+            chess.KNIGHT: 'N' if board.turn == chess.BLACK else 'n',
+        }
+        piece_moved = promotion_map.get(move.promotion, piece_moved)
+    
+    place_with_electromagnet(robot, board_tiles[to_square], piece_moved)
 
 def main():
     # Robot initialisation
@@ -851,22 +787,14 @@ def main():
     robot.setup_electromagnet(ELECTROMAGNET_PIN)
 
     capture = initialize_camera()
-    M = None  # Matrice de transformation homographique
-    M_inv = None  # Matrice inverse pour reprojeter vers l'image brute
-    dims = None  # Dimensions de l'échiquier warpé
 
-    # AI model loading
-    STOCKFISH_PATH = "src/ChessUtils/model_data/stockfish/stockfish-macos-m1-apple-silicon"
-    engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
-    print("Modèle IA chargé")
-   
     # Robot's wait pose object initialisation (SetUp in Niryo Studio)
     wait_pose = PoseObject(0.134, 0.0, 0.150, 0.0, math.pi/2, 0.0)
     robot.move(wait_pose)
 
     # Calibration instructions
-    init_ok = False
     print("[PROCESSING] Détection des marqueurs...")
+    boxes, virtual_boxes, M, dims = None, None, None, None
     while True:
         ret, img_und = capture.read()
         if not ret:
@@ -878,8 +806,14 @@ def main():
                 break
         except ValueError:
             print("Impossible de détecter les marqueurs.")
-            robot.wait(2) # slowing down capture process
-     
+            robot.wait(2)
+
+    # AI model loading
+    STOCKFISH_PATH = "src/ChessUtils/model_data/stockfish/stockfish-macos-m1-apple-silicon"
+    engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+    engine.configure({"UCI_LimitStrength": True, "UCI_Elo": 1500})
+    print("✓ Stockfish chargé")
+   
     # Player side detection
     input("→ Placez les pièces et appuyez sur Entrée…")
     player_plays_white = True
@@ -892,6 +826,7 @@ def main():
         for rank in '12345678':
             sq = f"{file}{rank}"
             board_tiles[sq] = chess_square_to_rel(sq, player_plays_white)
+ 
     buffer_tiles = {f"{c}{r}": None for c in '1234' for r in '1234'}
     buffer_positions = set_buffer_tiles_positions(buffer_tiles)
     # for pose in buffer_positions.values():
@@ -919,7 +854,6 @@ def main():
     #             print(f" Erreur sur {sq} : {e}")
 
     # First board state detection
-    input("Appuyez sur Entrée pour commencer la partie")
     if player_plays_white : 
             matrix_current = [['r','n','b','q','k','b','n','r'],
                     ['p','p','p','p','p','p','p','p'],
@@ -943,7 +877,6 @@ def main():
     capture_fn = lambda: capture_and_get_state(capture, boxes, virtual_boxes, M, dims, sticky_state)
     matrix_depart= capture_fn()
     matrix_depart = np.array(matrix_depart)
-    print (matrix_depart)
 
     max_tries = FRAME_COUNT
     tries = 0
@@ -959,71 +892,63 @@ def main():
         if tries >= max_tries:
             raise RuntimeError("Luminosité instable : plateau non fiable")
         
-    # Softaware's board initialisation
-    b = ChessBoard()
-    b.current_board = np.array(matrix_current)
-    b.player = 0  # Always white first
+    # Software's board initialisation
+    b = chess.Board()
     
-
     # Game loop
-    while game_result(b) is None:
-        is_human_turn = (b.player == 0 and player_plays_white) or \
-                        (b.player == 1 and not player_plays_white)
+    while not b.is_game_over():
+        is_human_turn = (b.turn == chess.WHITE and player_plays_white) or \
+                        (b.turn == chess.BLACK and not player_plays_white)
 
         if is_human_turn:
             # Wait until player plays legal move
-            matrix_new, _ = wait_player_move(matrix_current, capture_fn)
-            print(np.array(matrix_new))
-            from_sq, to_sq, move_type = b.get_move_details(
-                np.array(matrix_current), np.array(matrix_new)
+            matrix_new = wait_player_move(b, matrix_current, capture_fn)
+
+
+            move, piece_moved, captured_piece = detect_move_from_matrices(
+                np.array(matrix_current), np.array(matrix_new),b
             )
+
             # Updtating board object
-            b.move_piece(
-                square_to_index(from_sq[1]),
-                square_to_index(to_sq[1])
-            )
-            matrix_current = matrix_new
+            if move and move in b.legal_moves:
+                b.push(move)
+                matrix_current = matrix_new
 
         else:
             # Robot/AI turn
-            old_matrix = b.current_board.copy()
-            print(old_matrix)
-
-            # MCTS + net
-            fen = matrix_to_fen(matrix_current, b.player)
-            board_sf = chess.Board(fen)
-
-            result = engine.play(
-                board_sf,
-                chess.engine.Limit(time=0.3)  # 300 ms → largement suffisant
-            )
-
+            result = engine.play(b, chess.engine.Limit(time=0.3))
             move = result.move
-            from_sq_sf, to_sq_sf = stockfish_move_to_robot(move)
-            old_matrix = np.array(matrix_current)
-            new_matrix = old_matrix.copy()
+            
+            # Extraire les coordonnées pour le robot
+            from_sq = chess.square_name(move.from_square)
+            to_sq = chess.square_name(move.to_square)
+            r_from, c_from = square_to_index(from_sq)
+            r_to, c_to = square_to_index(to_sq)
 
-            r_from, c_from = square_to_index(from_sq_sf)
-            r_to, c_to = square_to_index(to_sq_sf)
+            piece_moved = matrix_current[r_from][c_from]
+            captured_piece = None
 
-            new_matrix[r_to][c_to] = new_matrix[r_from][c_from]
-            new_matrix[r_from][c_from] = " "
-            # Move details gathering
-            from_sq, to_sq, move_type = b.get_move_details(old_matrix,new_matrix)
+            if b.is_capture(move):
+                captured_piece = matrix_current[r_to][c_to]
+                if captured_piece == " ":  # Cas en-passant
+                    ep_row = r_from
+                    ep_col = c_to
+                    captured_piece = matrix_current[ep_row][ep_col]
 
             # Move execution with Ned2
-            play_move(
-                robot, from_sq, to_sq, move_type,
+            execute_move(
+                robot, move, b, piece_moved, captured_piece,
                 board_tiles, buffer_positions, buffer_state
             )
+
+            b.push(move)
+
+            matrix_current = board_to_matrix(b)
+
             robot.move(wait_pose)
 
-            b.current_board = new_matrix
-            b.player = 1 - b.player
-            matrix_current = capture_fn()
-
     # Game ends
-    print(f"### Résultat : {game_result(b)} ###")
+    print(f"### Résultat : {b.result()} ###")
     engine.quit()
     robot.move(wait_pose)
     robot.close_connection()

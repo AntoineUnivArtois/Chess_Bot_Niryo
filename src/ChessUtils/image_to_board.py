@@ -260,7 +260,7 @@ def detect_piece_color(roi, zoom_factor=2.5, debug=False):
     
     # CRITÈRES STRICTS pour le blanc
     # 1. Saturation TRÈS basse
-    _, very_low_saturation = cv2.threshold(s, 60, 255, cv2.THRESH_BINARY_INV)
+    _, very_low_saturation = cv2.threshold(s, 50, 255, cv2.THRESH_BINARY_INV)
     
     # 2. Valeur TRÈS haute
     _, very_high_value = cv2.threshold(v, 230, 255, cv2.THRESH_BINARY)
@@ -286,7 +286,7 @@ def detect_piece_color(roi, zoom_factor=2.5, debug=False):
     valid_white_contours = []
     taille_contour = []
     min_area = 8 * (zoom_factor ** 2)  # Seuil plus élevé
-    max_area = 40 * (zoom_factor ** 2)  # Éviter les grandes zones
+    max_area = 60 * (zoom_factor ** 2)  # Éviter les grandes zones
     
     for contour in white_contours:
        

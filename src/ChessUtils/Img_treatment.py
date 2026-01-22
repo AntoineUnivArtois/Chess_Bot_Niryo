@@ -21,7 +21,7 @@ class ImgTreatment:
         A_vert = cv2.GaussianBlur(A_vert, (5, 5), 0)
         background_B = 255-B 
         background_B = cv2.GaussianBlur(background_B, (5, 5), 0)
-        _, white_mask_1 = cv2.threshold(L, 150, 255, cv2.THRESH_BINARY)
+        _, white_mask_1 = cv2.threshold(L, 180, 255, cv2.THRESH_BINARY)
         _, white_mask_2 = cv2.threshold(B, 150, 255, cv2.THRESH_BINARY)
         white_mask_1 = cv2.bitwise_not(white_mask_1)
         white_mask = cv2.bitwise_or(white_mask_1, white_mask_2)
@@ -80,7 +80,7 @@ class ImgTreatment:
         # cv2.namedWindow('Mask', cv2.WINDOW_NORMAL)
         # cv2.resizeWindow('Mask', 1200, 1000)
 
-        # cv2.imshow('Mask',white_mask)
+        # cv2.imshow('Mask',white_mask_1)
         # cv2.waitKey(0)
         # cv2.destroyAllWindows()
 
