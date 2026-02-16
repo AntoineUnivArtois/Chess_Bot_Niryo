@@ -80,7 +80,7 @@ class ImgTreatment:
         # cv2.namedWindow('Mask', cv2.WINDOW_NORMAL)
         # cv2.resizeWindow('Mask', 1200, 1000)
 
-        # cv2.imshow('Mask',white_mask_1)
+        # cv2.imshow('Mask',chrom)
         # cv2.waitKey(0)
         # cv2.destroyAllWindows()
 

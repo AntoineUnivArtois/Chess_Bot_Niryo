@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 
-IM_EXTRACT_SMALL_SIDE_PIXELS = 1000
+IM_EXTRACT_SMALL_SIDE_PIXELS = 810
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION DES COULEURS (à adapter selon vos gommettes)
@@ -94,6 +94,84 @@ def detect_color_in_mask(hsv_roi, color_ranges_dict, min_area_percent):
 
     return best_color, best_ratio, best_center, best_area
 
+# def detect_in_quadrilateral(img_hsv, quad, color_ranges, min_area_percent=50):
+#     """
+#     Détecte une couleur dans un quadrilatère (perspective-aware).
+    
+#     Args:
+#         img_hsv: Image HSV complète
+#         quad: np.array([[x1,y1], [x2,y2], [x3,y3], [x4,y4]]) coins du quad
+#         color_ranges: dict des plages de couleurs
+#         min_area_percent: seuil de détection
+    
+#     Returns:
+#         (detected_color, confidence, center_in_image, area)
+#     """
+#     # Créer un masque pour le quadrilatère
+#     h, w = img_hsv.shape[:2]
+#     quad_mask = np.zeros((h, w), dtype=np.uint8)
+#     cv2.fillConvexPoly(quad_mask, quad.astype(np.int32), 255)
+    
+#     # Bounding box pour optimisation
+#     x_coords = quad[:, 0]
+#     y_coords = quad[:, 1]
+#     x1, x2 = int(np.floor(x_coords.min())), int(np.ceil(x_coords.max()))
+#     y1, y2 = int(np.floor(y_coords.min())), int(np.ceil(y_coords.max()))
+    
+#     # Clipping pour rester dans l'image
+#     x1, y1 = max(0, x1), max(0, y1)
+#     x2, y2 = min(w, x2), min(h, y2)
+    
+#     # ROI
+#     roi_hsv = img_hsv[y1:y2, x1:x2]
+#     roi_mask = quad_mask[y1:y2, x1:x2]
+    
+#     best_color = None
+#     best_ratio = 0.0
+#     best_center = None
+#     best_area = 0
+    
+#     for color_name, ranges in color_ranges.items():
+#         color_mask = np.zeros(roi_hsv.shape[:2], dtype=np.uint8)
+        
+#         for low, high in ranges:
+#             sub_mask = cv2.inRange(roi_hsv, low, high)
+#             color_mask = cv2.bitwise_or(color_mask, sub_mask)
+        
+#         # Appliquer le masque du quadrilatère
+#         color_mask = cv2.bitwise_and(color_mask, roi_mask)
+        
+#         contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+#         if not contours:
+#             continue
+        
+#         cnt = max(contours, key=cv2.contourArea)
+#         area = cv2.contourArea(cnt)
+        
+#         if area <= 140:
+#             continue
+        
+#         # Calcul du ratio par rapport à la surface du quad dans la ROI
+#         quad_area = cv2.contourArea(quad - np.array([x1, y1]))
+#         if quad_area == 0:
+#             continue
+        
+#         local_ratio = area / quad_area
+        
+#         if local_ratio >= min_area_percent / 100.0 and local_ratio > best_ratio:
+#             M = cv2.moments(cnt)
+#             if M["m00"] != 0:
+#                 cx = int(M["m10"] / M["m00"]) + x1  # Coordonnées dans l'image complète
+#                 cy = int(M["m01"] / M["m00"]) + y1
+#             else:
+#                 cx, cy = None, None
+            
+#             best_color = color_name
+#             best_ratio = local_ratio
+#             best_center = (cx, cy)
+#             best_area = area
+    
+#     return best_color, best_ratio, best_center, best_area
 
 def detect_colored_stickers(
     board_warped,
@@ -138,6 +216,7 @@ def detect_colored_stickers(
             color_ranges,
             min_area_percent
         )
+        
 
         if center is not None:
             piece_side = detect_piece_color(roi)
@@ -153,6 +232,43 @@ def detect_colored_stickers(
         }
     
     return result
+
+# def detect_colored_stickers(
+#     board_img,
+#     virtual_cells,  # Maintenant un dict de quadrilatères
+#     min_area_percent=50,
+#     color_ranges=None
+# ):
+#     """Version perspective-aware de la détection."""
+#     if color_ranges is None:
+#         color_ranges = COLOR_RANGES
+    
+#     img_work = board_img.copy()
+#     hsv = cv2.cvtColor(img_work, cv2.COLOR_BGR2HSV)
+    
+#     result = {}
+    
+#     for cell_name, quad in virtual_cells.items():
+#         detected_color, confidence, center, area = detect_in_quadrilateral(
+#             hsv, quad, color_ranges, min_area_percent
+#         )
+        
+#         if center is not None:
+#             piece_side = detect_piece_color(img_work[
+#                 int(quad[:, 1].min()):int(quad[:, 1].max()),
+#                 int(quad[:, 0].min()):int(quad[:, 0].max())
+#             ])
+#         else:
+#             piece_side = None
+        
+#         result[cell_name] = {
+#             "color": detected_color,
+#             "side": piece_side,
+#             "confidence": confidence,
+#             "center": center
+#         }
+    
+#     return result
 
 
 def board_state_from_colored_stickers(color, side, color_to_piece={"red": "K", "orange": "Q", "yellow": "B", "green": "R", "purple": "N", "blue": "P"}):
@@ -728,8 +844,7 @@ def visualize_real_and_virtual_grids(
     real_boxes,
     virtual_boxes,
     virtual_grid_pts=None,
-    label_font_scale=0.4,
-    show=True
+    label_font_scale=0.4
 ):
     """
     Visualisation superposée :
@@ -788,11 +903,6 @@ def visualize_real_and_virtual_grids(
             col_pts_clipped = [(int(np.clip(x, 0, w - 1)), int(np.clip(y, 0, h - 1))) for (x, y) in col_pts]
             for k in range(len(col_pts_clipped) - 1):
                 cv2.line(vis, col_pts_clipped[k], col_pts_clipped[k + 1], color_virtual, 1)
-
-    if show:
-        cv2.imshow('Real (blue) vs Virtual (red) grids - Press any key', vis)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
 
     return vis
 

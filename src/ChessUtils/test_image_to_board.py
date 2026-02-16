@@ -55,12 +55,7 @@ class TestImageToBoard(unittest.TestCase):
             ], dtype=np.float64)
 
             # Estimation simple des intrinsics à partir de la taille de l'image (aucune entrée manuelle requise)
-            h, w = self.img.shape[:2]
-            f_est = max(w, h)  # estimation du foyer (px). Simple et suffisant pour la visualisation.
-            cx = w / 2.0
-            cy = h / 2.0
-            camera_matrix = np.array([[f_est, 0, cx], [0, f_est, cy], [0, 0, 1]], dtype=np.float64)
-            dist_coeffs = np.zeros((5, 1), dtype=np.float64)
+            camera_matrix, dist_coeffs = self.estimate_camera_intrinsics(self.img.shape)
 
             # Créer la grille virtuelle projetée (hauteur réglable ici)
             self.virtual_boxes, _ = create_virtual_detection_grid(
@@ -68,9 +63,7 @@ class TestImageToBoard(unittest.TestCase):
                 image_corners,
                 camera_matrix,
                 dist_coeffs=dist_coeffs,
-                grid_size=8,
-                plane_height_cm=22.0,   # hauteur de la grille virtuelle en cm (configurable)
-                margin_percent=0.05
+                plane_height_cm=24.0,   
             )
 
             self.img_tr = ImgTreatment(self.img)
@@ -81,6 +74,37 @@ class TestImageToBoard(unittest.TestCase):
         """Release camera resources."""
         self.cap.release()
         cv2.destroyAllWindows()
+
+    def estimate_camera_intrinsics(self,img_shape, fov_deg=90):
+        """
+        Estime les intrinsics avec un FOV plus réaliste.
+        
+        Args:
+            img_shape: (height, width) de l'image
+            fov_deg: champ de vision horizontal estimé (60° par défaut)
+        
+        Returns:
+            camera_matrix, dist_coeffs
+        """
+        h, w = img_shape[:2]
+        
+        # Focale basée sur le FOV (plus précis que max(w,h))
+        f = w / (2 * np.tan(np.radians(fov_deg) / 2))
+        
+        # Centre optique (hypothèse : centre de l'image)
+        cx = w / 2.0
+        cy = h / 2.0
+        
+        camera_matrix = np.array([
+            [f, 0, cx],
+            [0, f, cy],
+            [0, 0, 1]
+        ], dtype=np.float64)
+        
+        # Coefficients de distorsion (zéro si caméra non calibrée)
+        dist_coeffs = np.zeros((5, 1), dtype=np.float64)
+        
+        return camera_matrix, dist_coeffs
 
     def wait_for_space_and_capture(self):
         """Capture depuis la caméra."""
@@ -102,15 +126,15 @@ class TestImageToBoard(unittest.TestCase):
                 cv2.destroyAllWindows()
                 raise RuntimeError("Capture annulée.")
 
-    # def test_virtual_grid_visualization(self):
-    #     """
-    #     Test visuel : crée une grille virtuelle projetée et l'affiche avec la grille réelle.
-    #     """
-    #     if self.img is None or self.boxes is None:
-    #         print("[ERROR] Impossible d'extraire les marqueurs")
-    #         return
-    #     # Visualiser la grille réelle (bleu) vs la grille virtuelle (rouge)
-    #     visualize_real_and_virtual_grids(self.img, self.boxes, self.virtual_boxes)
+    def test_virtual_grid_visualization(self):
+        """
+        Test visuel : crée une grille virtuelle projetée et l'affiche avec la grille réelle.
+        """
+        if self.img is None or self.boxes is None:
+            print("[ERROR] Impossible d'extraire les marqueurs")
+            return
+        # Visualiser la grille réelle (bleu) vs la grille virtuelle (rouge)
+        visualize_real_and_virtual_grids(self.img, self.boxes, self.virtual_boxes)
 
     
 # # ─────────────────────────────────────────────────────────────────

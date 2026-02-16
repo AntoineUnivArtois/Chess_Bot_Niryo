@@ -64,7 +64,7 @@ class HoughCircleParameterTuner:
         
         return circles
     
-    def detect_circular_objects(self, min_area=140, max_area=600, min_circularity=0.6):
+    def detect_circular_objects(self, min_area=140, max_area=700, min_circularity=0.6):
         """
         Détecte des objets circulaires dans un masque binaire
         Retourne une liste de cercles

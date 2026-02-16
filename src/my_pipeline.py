@@ -39,7 +39,11 @@ from ChessUtils import (
     create_virtual_detection_grid,
     detect_colored_stickers,
     board_state_from_colored_stickers,
+    visualize_real_and_virtual_grids,
     Img_treatment,
+    ChessTeacher,
+    MarkerValidator,
+    ChessFeedbackGenerator,
     COLOR_RANGES
 
 )
@@ -53,7 +57,7 @@ CAMERA_ID = 0
 CELL_SIZE = 0.04  # 4 cm
 ELECTROMAGNET_PIN = 'DO4'
 BOARD_SIZE = CELL_SIZE*8   # m
-BOARD_THICKNESS = 0.013  # Épaisseur du plateau en m
+BOARD_THICKNESS = 0.013 # Épaisseur du plateau en m
 
 COORD_BASE_MM = np.array([
     [436, -148],
@@ -125,6 +129,9 @@ def chess_square_to_rel(square: str, player_plays_white=True):
     x_mm, y_mm = case_center(i, j)
 
     return x_mm*0.001, y_mm*0.001
+
+def invert_matrix(matrix):
+    return [row[::-1] for row in matrix[::-1]]
 
 def init_sticky_state(boxes):
     sticky = {}
@@ -205,8 +212,12 @@ def board_to_matrix(board: chess.Board):
     for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece:
-            row = 7 - chess.square_rank(square)
-            col = chess.square_file(square)
+            rank = chess.square_rank(square)
+            file = chess.square_file(square)
+
+            row = 7 - rank
+            col = file
+
             matrix[row][col] = piece.symbol()
 
     return matrix
@@ -217,7 +228,7 @@ def board_to_matrix(board: chess.Board):
 def detect_move_from_matrices(
     before: np.ndarray, 
     after: np.ndarray,
-    board: chess.Board
+    board: chess.Board,
 ) -> tuple:
     """
     Détecte le coup joué en comparant deux matrices.
@@ -320,6 +331,37 @@ def initialize_camera():
 
     return cap
 
+def estimate_camera_intrinsics(img_shape, fov_deg=90):
+    """
+    Estime les intrinsics avec un FOV plus réaliste.
+    
+    Args:
+        img_shape: (height, width) de l'image
+        fov_deg: champ de vision horizontal estimé (60° par défaut)
+    
+    Returns:
+        camera_matrix, dist_coeffs
+    """
+    h, w = img_shape[:2]
+    
+    # Focale basée sur le FOV (plus précis que max(w,h))
+    f = w / (2 * np.tan(np.radians(fov_deg) / 2))
+    
+    # Centre optique (hypothèse : centre de l'image)
+    cx = w / 2.0
+    cy = h / 2.0
+    
+    camera_matrix = np.array([
+        [f, 0, cx],
+        [0, f, cy],
+        [0, 0, 1]
+    ], dtype=np.float64)
+    
+    # Coefficients de distorsion (zéro si caméra non calibrée)
+    dist_coeffs = np.zeros((5, 1), dtype=np.float64)
+    
+    return camera_matrix, dist_coeffs
+
 def detect_board(frame):
     """
     Détecte l'échiquier une seule fois.
@@ -329,7 +371,7 @@ def detect_board(frame):
     warp, M, dims, corners, margin_px = extract_img_markers_with_margin(
         frame,
         workspace_ratio=1.0,
-        base_size=800,
+        base_size=810,
     )
     
     if warp is None or corners is None:
@@ -348,24 +390,16 @@ def detect_board(frame):
     bl = (boxes['a1'][0], boxes['a1'][3])
     image_corners = np.array([tl, tr, br, bl], dtype=np.float64)
     
-    # Coins 3D du plateau réel (240 x 240 mm)
+    # Coins 3D du plateau réel
     real_corners_3d = np.array([
         [0.0, 0.0, 0.0],       # tl
-        [240.0, 0.0, 0.0],     # tr
-        [240.0, 240.0, 0.0],   # br
-        [0.0, 240.0, 0.0],     # bl
+        [320.0, 0.0, 0.0],     # tr
+        [320.0, 320.0, 0.0],   # br
+        [0.0, 320.0, 0.0],     # bl
     ], dtype=np.float64)
     
     # Estimation simple des intrinsics
-    h, w = warp.shape[:2]
-    f_est = max(w, h)
-    cx = w / 2.0
-    cy = h / 2.0
-    camera_matrix = np.array(
-        [[f_est, 0, cx], [0, f_est, cy], [0, 0, 1]],
-        dtype=np.float64
-    )
-    dist_coeffs = np.zeros((5, 1), dtype=np.float64)
+    camera_matrix, dist_coeffs = estimate_camera_intrinsics(warp.shape)
     
     # Créer la grille virtuelle projetée
     virtual_boxes, _ = create_virtual_detection_grid(
@@ -374,14 +408,14 @@ def detect_board(frame):
         camera_matrix,
         dist_coeffs=dist_coeffs,
         grid_size=8,
-        plane_height_cm=22.0,
+        plane_height_cm=24.0,
         margin_percent=0.05
     )
     
     board_detected = True
     print("[SUCCESS] Échiquier détecté avec succès ✓\n")
 
-    return boxes, virtual_boxes, board_detected, M, dims
+    return warp, boxes, virtual_boxes, board_detected, M, dims
 
 def process_frame(frame, M, dims, boxes, virtual_boxes, sticky_state):
         """
@@ -444,7 +478,7 @@ def capture_and_get_state(cap, boxes, virtual_boxes, M, dims, sticky_state):
     
     return board_state_matrix
 
-def wait_player_move(board, matrix_current, capture_fn):
+def wait_player_move(board, matrix_current, capture_fn, player_has_white):
     """Attend qu'un coup humain valide soit détecté"""
     valid_move = False
 
@@ -477,6 +511,9 @@ def wait_player_move(board, matrix_current, capture_fn):
                 if board.is_castling(move):
                     from_sq = square_to_index(chess.square_name(move.from_square))
                     to_sq   = square_to_index(chess.square_name(move.to_square))
+                    if not player_has_white:
+                        from_sq = (7 - from_sq[0], 7 - from_sq[1])
+                        to_sq   = (7 - to_sq[0], 7 - to_sq[1])
 
                     if from_sq in removed_squares and to_sq in added_squares:
                         print("Roque détecté")
@@ -528,60 +565,44 @@ def wait_player_move(board, matrix_current, capture_fn):
         print(np.array(matrix_detected))
         continue
 
-def player_has_white(corners, yolo_result):
+def player_has_white(virtual_boxes, capture_fn):
     """
     Determine whether the human player has the white pieces by comparing distances from the top-left marker to detected piece centers.
 
     Inputs:
-        corners (list[Marker]) – sorted list of 4 detected markers, with corners[0] being the top-left.
+        virtual_boxes (dict) – a dictionary mapping virtual box names to their positions.
+        capture_fn (function) – a function that returns the current state of the board.
 
     Outputs:
         bool or None – True if white pieces are closer on average (human plays White), False if black pieces are closer (human plays Black), or None if insufficient detections to decide.
     """
-
-    # Centre du marqueur en haut à gauche (NiryoMaker 1)
-    marker_tl = np.array(corners[0].get_center(), dtype=float)
-
-    # Récupération des tableaux NumPy depuis yolo_result
-    names = yolo_result.names
-    classes = yolo_result.boxes.cls.cpu().numpy().astype(int)
-    boxes = yolo_result.boxes.xyxy.cpu().numpy()
-
     # Initialisation des distances minimales
     min_dist_white = float('inf')
     min_dist_black = float('inf')
 
-    # Parcours de chaque détection YOLO
-    for box, cls_idx in zip(boxes, classes):
-        class_name = names[cls_idx]
+    matrix_detected = capture_fn()
+    tl = virtual_boxes['a8'][0]
 
-        # On ignore toute détection de mains
-        if class_name.lower() == "hand":
-            continue
+    for i_line,line in enumerate(matrix_detected):
+        for i_piece,piece in enumerate(line):
+            if piece.islower():
+                couleur = 'black'
+            elif piece.isupper():
+                couleur = 'white'
+            else:
+                continue
 
-        # Détermination de la couleur d'après la casse du nom :
-        # - minuscules → pièce noire
-        # - majuscules → pièce blanche
-        if class_name.islower():
-            couleur = 'black'
-        elif class_name.isupper():
-            couleur = 'white'
-        else:
-            # Si le nom mélange minuscules/majuscules ou n'est pas clair, on l'ignore
-            continue
+            box = square_to_index(f"{i_piece}{i_line}")
+            box_center = case_center(box[0], box[1])
 
-        # Calcul du centre de la bounding box
-        x1, y1, x2, y2 = box
-        box_center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=float)
+            # Distance euclidienne entre le marqueur TL et le centre de la box
+            dist = np.linalg.norm(tl - box_center)
 
-        # Distance euclidienne entre le marqueur TL et le centre de la box
-        dist = np.linalg.norm(marker_tl - box_center)
-
-        # Mise à jour de la distance minimale selon la couleur
-        if couleur == 'white' and dist < min_dist_white:
-            min_dist_white = dist
-        elif couleur == 'black' and dist < min_dist_black:
-            min_dist_black = dist
+            # Mise à jour de la distance minimale selon la couleur
+            if couleur == 'white' and dist < min_dist_white:
+                min_dist_white = dist
+            elif couleur == 'black' and dist < min_dist_black:
+                min_dist_black = dist
 
     # Si aucune pièce blanche ou aucune pièce noire n’a été détectée, on ne peut pas décider
     if min_dist_white == float('inf') or min_dist_black == float('inf'):
@@ -660,7 +681,7 @@ def pickup_with_electromagnet(robot, position, piece_type):
     robot.wait(1)
     robot.shift_pose(RobotAxis.Z, SHIFT_DIST_EMPTY)
 
-def place_with_electromagnet(robot, position, piece_type):
+def place_with_electromagnet(robot, position, piece_type, if_buffer = False):
     """
     Place a chess piece at a specified board position using the electromagnet.
 
@@ -680,7 +701,10 @@ def place_with_electromagnet(robot, position, piece_type):
     robot.shift_pose(RobotAxis.Z, -SHIFT_DIST_EMPTY)
     robot.deactivate_electromagnet(ELECTROMAGNET_PIN)
     robot.wait(1)
-    robot.shift_pose(RobotAxis.Z,  SHIFT_DIST_EMPTY-h)
+    if if_buffer:
+        robot.shift_pose(RobotAxis.Z,  SHIFT_DIST_EMPTY-h-0.006)
+    else :
+        robot.shift_pose(RobotAxis.Z,  SHIFT_DIST_EMPTY-h)
 
 def execute_move(
     robot, 
@@ -760,7 +784,7 @@ def execute_move(
         
         # Déplacer la pièce capturée au buffer
         pickup_with_electromagnet(robot, board_tiles[to_square], piece_to_capture)
-        place_with_electromagnet(robot, buffer_positions[free_buffer], piece_to_capture)
+        place_with_electromagnet(robot, buffer_positions[free_buffer], piece_to_capture, True)
         buffer_state[free_buffer] = piece_to_capture
     
     # Déplacement normal
@@ -784,6 +808,7 @@ def main():
     robot.clear_collision_detected()
     robot.calibrate_auto()
     robot.update_tool()
+    robot.set_arm_max_velocity(100)
     robot.setup_electromagnet(ELECTROMAGNET_PIN)
 
     capture = initialize_camera()
@@ -798,27 +823,44 @@ def main():
     while True:
         ret, img_und = capture.read()
         if not ret:
-            print("[ERROR] Impossible de capturer.")
+            print("[ERROR] Impossible de capturer")
             break
+
         try:
-            boxes, virtual_boxes, init_ok, M, dims = detect_board(img_und)
-            if init_ok:
+            warp, boxes, virtual_boxes, init_ok, M, dims = detect_board(img_und)
+            if not init_ok:
+                continue
+
+            vis = visualize_real_and_virtual_grids(warp, boxes, virtual_boxes)
+
+            # Affiche l'interface Tkinter pour valider
+            validator = MarkerValidator(vis)
+            if validator.result:
+                print("[OK] Marqueurs validés")
                 break
-        except ValueError:
-            print("Impossible de détecter les marqueurs.")
-            robot.wait(2)
+            else:
+                print("[Retry] Nouvelle tentative")
+                continue
+
+        except ValueError as e:
+            continue
 
     # AI model loading
     STOCKFISH_PATH = "src/ChessUtils/model_data/stockfish/stockfish-macos-m1-apple-silicon"
     engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
-    engine.configure({"UCI_LimitStrength": True, "UCI_Elo": 1500})
+    engine.configure({"UCI_LimitStrength": True, "UCI_Elo": 1320})
+    teacher = ChessTeacher(engine)
+    feedback = ChessFeedbackGenerator()
     print("✓ Stockfish chargé")
+
+    sticky_state = init_sticky_state(boxes)
+    capture_fn = lambda: capture_and_get_state(capture, boxes, virtual_boxes, M, dims, sticky_state)
    
     # Player side detection
     input("→ Placez les pièces et appuyez sur Entrée…")
-    player_plays_white = True
-    # player_plays_white = player_has_white(corners, yolo_res)
-    # print(f"Joueur = {'Blancs' if player_plays_white else 'Noirs'}")
+    # player_plays_white = True
+    player_plays_white = player_has_white(virtual_boxes, capture_fn)
+    print(f"Joueur = {'Blancs' if player_plays_white else 'Noirs'}")
 
     # Board and buffer tiles poses calculation based on NiryoMarkerTL pose
     board_tiles = {}
@@ -864,17 +906,15 @@ def main():
                     ['P','P','P','P','P','P','P','P'],
                     ['R','N','B','Q','K','B','N','R']]
     else : 
-        matrix_current = [['R','N','B','Q','K','B','N','R'],
+        matrix_current = [['R','N','B','K','Q','B','N','R'],
                     ['P','P','P','P','P','P','P','P'],
                     [' ',' ',' ',' ',' ',' ',' ',' '],
                     [' ',' ',' ',' ',' ',' ',' ',' '],
                     [' ',' ',' ',' ',' ',' ',' ',' '],
                     [' ',' ',' ',' ',' ',' ',' ',' '],
                     ['p','p','p','p','p','p','p','p'],
-                    ['r','n','b','q','k','b','n','r']]
+                    ['r','n','b','k','q','b','n','r']]
         
-    sticky_state = init_sticky_state(boxes)
-    capture_fn = lambda: capture_and_get_state(capture, boxes, virtual_boxes, M, dims, sticky_state)
     matrix_depart= capture_fn()
     matrix_depart = np.array(matrix_depart)
 
@@ -890,7 +930,8 @@ def main():
         tries += 1
 
         if tries >= max_tries:
-            raise RuntimeError("Luminosité instable : plateau non fiable")
+            raise RuntimeError("Luminosité instable : plateau non fiable. Recommencez l'initialisation.")
+        
         
     # Software's board initialisation
     b = chess.Board()
@@ -902,17 +943,29 @@ def main():
 
         if is_human_turn:
             # Wait until player plays legal move
-            matrix_new = wait_player_move(b, matrix_current, capture_fn)
+            matrix_view = wait_player_move(b, matrix_current, capture_fn, player_plays_white)
 
+            if player_plays_white:
+                matrix_calcul = matrix_view
+            else:
+                matrix_current = invert_matrix(matrix_current)
+                matrix_calcul = invert_matrix(matrix_view)
 
             move, piece_moved, captured_piece = detect_move_from_matrices(
-                np.array(matrix_current), np.array(matrix_new),b
+                np.array(matrix_current), np.array(matrix_calcul),b
             )
 
             # Updtating board object
             if move and move in b.legal_moves:
-                b.push(move)
-                matrix_current = matrix_new
+                # b.push(move)
+                b, result = teacher.analyse_move(b, move, player_plays_white)
+                print(result["classification"])
+                print(result["delta"])
+                print(feedback.generate(result["reason"]))
+                matrix_current = board_to_matrix(b)
+
+            elif not player_plays_white:
+                matrix_current = invert_matrix(matrix_current)
 
         else:
             # Robot/AI turn
@@ -944,6 +997,10 @@ def main():
             b.push(move)
 
             matrix_current = board_to_matrix(b)
+
+            if not player_plays_white:
+                matrix_current = invert_matrix(matrix_current)
+            print(np.array(matrix_current))
 
             robot.move(wait_pose)
 
